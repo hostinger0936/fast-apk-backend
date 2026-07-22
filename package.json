@@ -1,0 +1,39 @@
+{
+  "name": "admin-backend",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "start:prod": "npm run build && node dist/server.js",
+    "lint": "eslint --ext .ts src",
+    "format": "prettier --write \"src/**/*.ts\""
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.1",
+    "firebase-admin": "^12.7.0",
+    "helmet": "^7.2.0",
+    "mongoose": "^7.8.9",
+    "morgan": "^1.10.1",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.25",
+    "@types/node": "^20.19.33",
+    "@types/ws": "^8.18.1",
+    "eslint": "^8.57.1",
+    "nodemon": "^3.1.11",
+    "prettier": "^2.8.8",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.9.3"
+  },
+  "description": "1. Copy `.env.example` → `.env` and fill values.\r 2. Install deps:\r    ```bash\r    npm ci",
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
