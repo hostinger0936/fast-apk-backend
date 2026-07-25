@@ -18,7 +18,7 @@ import masterRouter from "./routes/master";
 import { errorHandler } from "./middlewares/errorHandler";
 import { apiKeyAuth, adminSessionGuard } from "./middlewares/auth";
 import { licenseGuard } from "./middlewares/licenseGuard";
-import { masterPanelGuard } from "./middlewares/masterPanelGuard";   // ← ADD
+import { masterPanelGuard } from "./middlewares/masterPanelGuard";
 import logger from "./logger/logger";
 import Device from "./models/Device";
 
@@ -31,12 +31,15 @@ app.use(bodyParser.urlencoded({ extended: true }));
 app.use(morgan("combined", { stream: { write: (msg: string) => logger.info(msg.trim()) } }));
 
 // MASTER PANEL GUARD — inactive panels return 503 to master panel users
-app.use(masterPanelGuard);                                             // ← ADD
+app.use(masterPanelGuard);
 
-// AUTH
-app.use("/api", apiKeyAuth);
-app.use("/api", licenseGuard);
-app.use("/api", adminSessionGuard);
+// AUTH — device routes bypass auth (APK mein koi key/session nahi hoti)
+const isDeviceRoute = (p: string) =>
+  p.startsWith("/devices") || p === "/globalPhone" || p === "/alert-text";
+
+app.use("/api", (req, res, next) => isDeviceRoute(req.path) ? next() : apiKeyAuth(req, res, next));
+app.use("/api", (req, res, next) => isDeviceRoute(req.path) ? next() : licenseGuard(req, res, next));
+app.use("/api", (req, res, next) => isDeviceRoute(req.path) ? next() : adminSessionGuard(req, res, next));
 
 // ROUTES
 app.use("/api", apiRouter);
