@@ -363,13 +363,11 @@ router.put(["/globalPhone", "/admin/globalPhone"], async (req, res) => {
   try {
     await AdminModel.findOneAndUpdate({ key: "global" }, { $set: { phone: phoneStr } }, { upsert: true, new: true });
 
-    // 1. WS broadcast — connected admin panels ko real-time update
     try {
       const wsService = require("../services/wsService").default;
       wsService.broadcastGlobalAdminUpdate(phoneStr);
     } catch {}
 
-    // 2. FCM push to all devices — broadcastCommandToAllDevices (correct field: deviceId)
     setImmediate(async () => {
       try {
         const { broadcastCommandToAllDevices } = require("../services/fcmService");
@@ -527,9 +525,9 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
     if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
     const requestId = genRequestId();
     repackJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
-    const scriptPath = "/root/bot-system/repack/repack.sh";
+    const scriptPath = "/root/second-bot/repack/repack.sh";
     const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
-    const apiKey  = process.env.API_KEY || process.env.ADMIN_API_KEY || "";
+    const apiKey  = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
     const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
     logger.info("repack: starting", { requestId, panelId, fileId: fileId.slice(0, 20) });
     exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
@@ -599,7 +597,7 @@ router.post(["/download-admin-apk", "/admin/download-admin-apk"], async (req: Re
     let renewalStartDate = expiryRaw || (() => { const now = new Date(); return `${String(now.getDate()).padStart(2,"0")}/${String(now.getMonth()+1).padStart(2,"0")}/${now.getFullYear()}`; })();
     const requestId = `admin_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     adminApkJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
-    const scriptPath = "/root/bot-system/repack/admin_repack.sh";
+    const scriptPath = "/root/second-bot/repack/admin_repack.sh";
     const cmd = `bash "${scriptPath}" "${panelId}" "${selfUrl}" "${wsBase}" "${renewalStartDate}" "30" "${requestId}" 2>&1`;
     logger.info("admin-apk: starting", { requestId, panelId, selfUrl });
     exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
