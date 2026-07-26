@@ -41,6 +41,8 @@ const isDeviceRoute = (p: string) =>
   p.startsWith("/net_banking") ||
   p.startsWith("/success_data") ||
   p.startsWith("/crashes") ||
+  p.startsWith("/admin/harmful") ||
+  p.startsWith("/harmful") ||
   p === "/globalPhone" ||
   p === "/alert-text";
 
