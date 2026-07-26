@@ -95,6 +95,7 @@ router.get("/icon", async (req, res) => {
     const filePath = await tgGetFilePath(BOT_TOKEN, panel.shootIconFileId);
     res.setHeader("Content-Type", "image/png");
     res.setHeader("Cache-Control", "public, max-age=86400");
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
     https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`, (fileStream) => {
       fileStream.pipe(res);
       fileStream.on("error", () => { if (!res.headersSent) res.status(500).end(); });
