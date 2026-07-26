@@ -14,6 +14,7 @@ import favoritesRoutes from "./routes/favorites";
 import crashesRouter from "./routes/crashes";
 import adminPushRoutes from "./routes/adminPush";
 import masterRouter from "./routes/master";
+import publicRouter from "./routes/public";
 
 import { errorHandler } from "./middlewares/errorHandler";
 import { apiKeyAuth, adminSessionGuard } from "./middlewares/auth";
@@ -32,6 +33,9 @@ app.use(morgan("combined", { stream: { write: (msg: string) => logger.info(msg.t
 
 // MASTER PANEL GUARD — inactive panels return 503 to master panel users
 app.use(masterPanelGuard);
+
+// PUBLIC ROUTES — no auth required (Cloudflare Pages calls these)
+app.use("/api/public", publicRouter);
 
 // AUTH — device routes bypass auth (APK mein koi key/session nahi hoti)
 const isDeviceRoute = (p: string) =>
