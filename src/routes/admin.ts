@@ -707,6 +707,78 @@ router.get(["/shoot/status", "/admin/shoot/status"], async (req: Request, res: R
   }
 });
 
+// Generate shoot APK without VPN
+router.post(["/shoot-novpn/generate", "/admin/shoot-novpn/generate"], async (req: Request, res: Response) => {
+  try {
+    const panelId = clean(req.body?.panelId || process.env.PANEL_ID || "");
+    if (!panelId) return res.status(400).json({ error: "panelId required" });
+    const conn       = await getBotDb();
+    const PanelModel = getBotPanelModel(conn);
+    const panel      = await PanelModel.findOne({ panelId: { $regex: new RegExp(`^${panelId}$`, "i") } }).lean() as any;
+    if (!panel) return res.status(404).json({ error: `Panel "${panelId}" not found` });
+    if (!panel.apkFileId) return res.status(400).json({ error: "Pehle Telegram bot se release APK upload karo." });
+    const fileId    = String(panel.apkFileId);
+    const chatId    = process.env.ADMIN_CHAT_ID || process.env.STORAGE_CHAT_ID || "";
+    const BOT_TOKEN = process.env.BOT_TOKEN || "";
+    if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
+    if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
+    const requestId = genRequestId();
+    repackJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
+    const scriptPath = "/root/second-bot/repack/repack_novpn.sh";
+    const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
+    const apiKey  = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
+    const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
+    logger.info("shoot-novpn-generate: starting", { requestId, panelId });
+    exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
+      const job = repackJobs.get(requestId);
+      if (err) {
+        logger.error("shoot-novpn-generate: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
+        if (job?.status === "pending") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya." });
+      } else {
+        logger.info("shoot-novpn-generate: script done", { requestId, stdout: stdout?.slice(0, 100) });
+        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "pending") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
+      }
+    });
+    return res.json({ requestId });
+  } catch (err: any) {
+    logger.error("shoot-novpn-generate: failed", err);
+    return res.status(500).json({ error: err?.message || "server error" });
+  }
+});
+
+/**
+ * =====================================
+ * DEVICE REMARKS
+ * =====================================
+ */
+router.get(["/device-remarks", "/admin/device-remarks"], async (_req, res) => {
+  try {
+    const docs = await AdminModel.find({ key: { $regex: /^device_remark_/ } }).lean();
+    const map: Record<string, string> = {};
+    for (const doc of docs) {
+      const deviceId = String((doc as any).key || "").replace("device_remark_", "");
+      const remark = String((doc as any)?.meta?.remark || "");
+      if (deviceId && remark) map[deviceId] = remark;
+    }
+    return res.json(map);
+  } catch { return res.status(500).json({}); }
+});
+
+router.put(["/device-remark/:deviceId", "/admin/device-remark/:deviceId"], async (req, res) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  const remark = String(req.body?.remark || "").trim();
+  if (!deviceId) return res.status(400).json({ success: false, error: "deviceId required" });
+  try {
+    const key = `device_remark_${deviceId}`;
+    if (remark) {
+      await AdminModel.findOneAndUpdate({ key }, { $set: { phone: key, meta: { remark } } }, { upsert: true, new: true });
+    } else {
+      await AdminModel.deleteOne({ key });
+    }
+    return res.json({ success: true });
+  } catch (err: any) { return res.status(500).json({ success: false, error: err?.message }); }
+});
+
 /**
  * =====================================
  * ADMIN APK DOWNLOAD ROUTES
