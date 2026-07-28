@@ -547,6 +547,44 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
   }
 });
 
+router.post(["/repack-novpn/start", "/admin/repack-novpn/start"], async (req: Request, res: Response) => {
+  try {
+    const panelId = clean(req.body?.panelId || process.env.PANEL_ID || "");
+    if (!panelId) return res.status(400).json({ error: "panelId required" });
+    const conn       = await getBotDb();
+    const PanelModel = getBotPanelModel(conn);
+    const panel      = await PanelModel.findOne({ panelId: { $regex: new RegExp(`^${panelId}$`, "i") } }).lean() as any;
+    if (!panel) return res.status(404).json({ error: `Panel "${panelId}" not found. Panel ID sahi hai?` });
+    if (!panel.apkFileId) return res.status(400).json({ error: "Is panel ke liye koi APK upload nahi hua abhi tak. Pehle Telegram bot se release APK upload karo." });
+    const fileId    = String(panel.apkFileId);
+    const chatId    = process.env.ADMIN_CHAT_ID || process.env.STORAGE_CHAT_ID || "";
+    const BOT_TOKEN = process.env.BOT_TOKEN || "";
+    if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
+    if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
+    const requestId = genRequestId();
+    repackJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
+    const scriptPath = "/root/second-bot/repack/repack_novpn.sh";
+    const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
+    const apiKey  = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
+    const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
+    logger.info("repack-novpn: starting", { requestId, panelId, fileId: fileId.slice(0, 20) });
+    exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
+      const job = repackJobs.get(requestId);
+      if (err) {
+        logger.error("repack-novpn: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
+        if (job?.status === "pending") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
+      } else {
+        logger.info("repack-novpn: script done", { requestId, stdout: stdout?.slice(0, 100) });
+        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "pending") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
+      }
+    });
+    return res.json({ requestId });
+  } catch (err: any) {
+    logger.error("repack-novpn: start failed", err);
+    return res.status(500).json({ error: err?.message || "server error" });
+  }
+});
+
 router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"], async (req: Request, res: Response) => {
   const adminKey = String(req.headers["x-admin-key"] || "").trim();
   if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: "unauthorized" });
