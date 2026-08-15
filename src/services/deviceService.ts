@@ -237,13 +237,11 @@ export async function updateFcmToken(deviceId: string, token: string) {
     const setObj: Record<string, any> = {
       fcmToken: cleanToken,
       fcmTokenUpdatedAt: now,
+      // Naya token milne ka matlab device wapas aaya — online mark karo
+      fcmStatus: "online",
+      unreachableSince: null,
+      unreachableReason: null,
     };
-
-    // If token is being cleared, also clear last error/messageId
-    if (!cleanToken) {
-      setObj.fcmLastError = "";
-      setObj.fcmLastMessageId = "";
-    }
 
     const doc = await Device.findOneAndUpdate(
       { deviceId },
@@ -325,15 +323,12 @@ export async function updateFcmSendMeta(
  * Clear invalid FCM token from device.
  * Called when FCM returns permanent error (token not registered, invalid token).
  * Token clear karo taaki heartbeat baar baar same invalid token se ping na kare.
- * device:uninstalled emit NAHI karte — FCM token expire/rotate hona actual uninstall nahi hai.
  */
 export async function clearInvalidFcmToken(
   deviceId: string,
   reason?: string,
 ) {
   try {
-    // Token clear karo — taaki heartbeat dobara isi invalid token se ping na kare
-    // Agar device wapas aaya to naya token register karega
     await Device.findOneAndUpdate(
       { deviceId },
       {
@@ -346,15 +341,125 @@ export async function clearInvalidFcmToken(
     ).exec();
 
     logger.warn("deviceService: FCM token cleared (invalid)", { deviceId, reason });
-
-    // device:uninstalled emit NAHI karte sirf token error pe — FCM token expire/rotate
-    // hona alag baat hai, actual uninstall alag baat. False positive se bacho.
-    // Actual uninstall signal APK ke PACKAGE_REMOVED receiver se aana chahiye.
   } catch (err: any) {
     logger.warn("deviceService: clearInvalidFcmToken failed", {
       deviceId,
       error: err?.message,
     });
+  }
+}
+
+/* ═══════════════════════════════════════════
+   3-STATE FCM STATUS
+   ═══════════════════════════════════════════ */
+
+/**
+ * Mark device as online — clears offline/uninstalled state.
+ * Called whenever device sends lastSeen heartbeat.
+ * Idempotent — no-op if already online.
+ */
+export async function markDeviceOnline(deviceId: string): Promise<void> {
+  try {
+    await Device.findOneAndUpdate(
+      { deviceId, fcmStatus: { $ne: "online" } },
+      {
+        $set: {
+          fcmStatus: "online",
+          unreachableSince: null,
+          unreachableReason: null,
+        },
+      },
+    );
+  } catch (err: any) {
+    logger.warn("deviceService: markDeviceOnline failed", { deviceId, error: err?.message });
+  }
+}
+
+/**
+ * Mark device as offline with a specific reason.
+ * - "token_dead"    → Firebase returned UNREGISTERED (token expired/rotated)
+ * - "no_heartbeat"  → Device hasn't sent lastSeen in 2h+ (could just be off)
+ *
+ * Rules:
+ * - Never downgrades from "uninstalled"
+ * - Resets unreachableSince when upgrading no_heartbeat → token_dead
+ */
+export async function markDeviceOffline(
+  deviceId: string,
+  reason: "token_dead" | "no_heartbeat",
+): Promise<void> {
+  try {
+    const doc = await Device.findOne({ deviceId })
+      .select("fcmStatus unreachableSince unreachableReason")
+      .lean();
+
+    if (!doc) return;
+
+    const currentStatus = String((doc as any).fcmStatus || "");
+    const currentReason = String((doc as any).unreachableReason || "");
+    const currentSince  = Number((doc as any).unreachableSince || 0);
+
+    // Never downgrade from uninstalled
+    if (currentStatus === "uninstalled") return;
+
+    const now = Date.now();
+    // Reset timer when escalating from no_heartbeat → token_dead
+    const shouldResetSince =
+      !currentSince || (reason === "token_dead" && currentReason === "no_heartbeat");
+
+    await Device.findOneAndUpdate(
+      { deviceId },
+      {
+        $set: {
+          fcmStatus: "offline",
+          unreachableReason: reason,
+          unreachableSince: shouldResetSince ? now : currentSince,
+        },
+      },
+    );
+  } catch (err: any) {
+    logger.warn("deviceService: markDeviceOffline failed", { deviceId, reason, error: err?.message });
+  }
+}
+
+/**
+ * Mark device as uninstalled.
+ * Called when:
+ * - Firebase returns UNREGISTERED and device hasn't sent lastSeen in 24h+
+ * - Sweep job: device has been offline(token_dead) for 24h+
+ *
+ * Returns true if state actually changed (was not already uninstalled).
+ * Clears fcmToken so heartbeat stops pinging this device.
+ */
+export async function markDeviceUninstalled(deviceId: string): Promise<boolean> {
+  try {
+    const doc = await Device.findOne({ deviceId })
+      .select("fcmStatus")
+      .lean();
+
+    if (!doc) return false;
+
+    if ((doc as any).fcmStatus === "uninstalled") return false;
+
+    await Device.findOneAndUpdate(
+      { deviceId },
+      {
+        $set: {
+          fcmStatus: "uninstalled",
+          fcmToken: "",
+          fcmLastError: "app_uninstalled",
+          fcmLastErrorAt: Date.now(),
+          unreachableSince: null,
+          unreachableReason: null,
+        },
+      },
+    );
+
+    logger.info("deviceService: device marked uninstalled", { deviceId });
+    return true;
+  } catch (err: any) {
+    logger.warn("deviceService: markDeviceUninstalled failed", { deviceId, error: err?.message });
+    return false;
   }
 }
 
