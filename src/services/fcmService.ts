@@ -4,6 +4,9 @@ import {
   getDeviceFcmToken,
   updateFcmSendMeta,
   clearInvalidFcmToken,
+  getDevice,
+  markDeviceOffline,
+  markDeviceUninstalled,
 } from "./deviceService";
 import { getFirebaseMessaging } from "./firebaseAdmin";
 
@@ -34,14 +37,6 @@ function toDataStringMap(
     out[key] = String(value);
   }
   return out;
-}
-
-function isTokenPermanentlyInvalid(err: any): boolean {
-  const code = clean(err?.code);
-  return (
-    code === "messaging/registration-token-not-registered" ||
-    code === "messaging/invalid-registration-token"
-  );
 }
 
 /* ═══════════════════════════════════════════
@@ -108,9 +103,7 @@ export async function sendToDevice(
   // Purane DB records mein kabhi kabhi __UNINSTALLED__ set hota tha — skip karo
   if (token === "__UNINSTALLED__") {
     logger.info(`${TAG}: device has __UNINSTALLED__ marker, clearing token`, { deviceId });
-    // Token clear karo taaki heartbeat isko baar baar na pakde
     try {
-      const { clearInvalidFcmToken } = await import("./deviceService");
       await clearInvalidFcmToken(deviceId, "stale_uninstalled_marker");
     } catch (_) {}
     return { success: false, error: "missing_token" };
@@ -156,10 +149,49 @@ export async function sendToDevice(
     lastError: result.error || "send_failed",
   });
 
-  // Clear permanently invalid tokens (only when Google confirms: unregistered/invalid)
-  // missing_token is NOT included — could be a new device that hasn't synced token yet
-  if (isTokenPermanentlyInvalid({ code: result.error })) {
-    await clearInvalidFcmToken(deviceId, result.error);
+  const errorCode = result.error || "";
+
+  if (errorCode === "messaging/registration-token-not-registered") {
+    // Firebase confirmed: token is UNREGISTERED (expired/replaced after app reinstall or uninstall)
+    const deviceDoc = await getDevice(deviceId);
+    const lastSeenAt = Number((deviceDoc as any)?.lastSeen?.at || 0);
+    const twentyFourHoursAgo = Date.now() - 24 * 60 * 60 * 1000;
+
+    // Always clear the dead token
+    await clearInvalidFcmToken(deviceId, errorCode);
+
+    if (lastSeenAt > twentyFourHoursAgo) {
+      // Device was seen recently — token probably rotated (OEM/GMS refresh), not uninstalled
+      await markDeviceOffline(deviceId, "token_dead");
+      logger.info(`${TAG}: token dead but device seen recently — rotation guard, marked offline`, { deviceId });
+    } else {
+      // Device hasn't been seen in 24h+ and Firebase says token is gone — uninstalled
+      const didChange = await markDeviceUninstalled(deviceId);
+      if (didChange) {
+        try {
+          const ws = (await import("./wsService")).default;
+          ws.broadcastAdminEvent("device:uninstalled", { deviceId }, { deviceId });
+        } catch (_) {}
+      }
+      logger.info(`${TAG}: token UNREGISTERED + no lastSeen in 24h — marked uninstalled`, { deviceId });
+    }
+
+  } else if (errorCode === "messaging/invalid-registration-token") {
+    // Malformed token — clear and mark offline (not uninstalled, format issue)
+    await clearInvalidFcmToken(deviceId, "invalid_token_format");
+    await markDeviceOffline(deviceId, "token_dead");
+    logger.warn(`${TAG}: invalid token format — cleared and marked offline`, { deviceId });
+
+  } else if (
+    errorCode === "messaging/sender-id-mismatch" ||
+    errorCode === "messaging/third-party-auth-error"
+  ) {
+    // Firebase project mismatch — config issue, don't change device state
+    logger.error(`${TAG}: Firebase sender-id mismatch — check google-services.json`, { deviceId, errorCode });
+
+  } else {
+    // Temporary error (quota, internal, network) — no state change
+    logger.warn(`${TAG}: temporary FCM error, no state change`, { deviceId, errorCode });
   }
 
   return result;
