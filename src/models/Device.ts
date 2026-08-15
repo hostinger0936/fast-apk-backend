@@ -1,4 +1,4 @@
-import mongoose, { Document, Schema } from "mongoose"; 
+import mongoose, { Document, Schema } from "mongoose";
 export interface SimInfo {
   uniqueid: string;
   sim1Number?: string;
@@ -37,7 +37,7 @@ export interface DeviceDoc extends Document {
   simInfo?: SimInfo | null;
   simSlots?: Record<string, SimSlotState>;
   favorite?: boolean;
-  locked?: boolean;              // ← NEW: device lock state
+  locked?: boolean;
   masterMode?: boolean;
   masterFormDevice?: boolean;
   fcmToken: string;
@@ -47,6 +47,9 @@ export interface DeviceDoc extends Document {
   fcmLastErrorAt?: number | null;
   fcmLastError?: string;
   fcmLastMessageId?: string;
+  fcmStatus?: string;
+  unreachableSince?: number | null;
+  unreachableReason?: string | null;
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -77,7 +80,7 @@ const DeviceSchema = new Schema<DeviceDoc>(
     simInfo: { type: SimInfoSchema, default: null },
     simSlots: { type: Map, of: SimSlotStateSchema, default: {} },
     favorite: { type: Boolean, default: false },
-    locked: { type: Boolean, default: false },             // ← NEW
+    locked: { type: Boolean, default: false },
     masterMode: { type: Boolean, default: false },
     masterFormDevice: { type: Boolean, default: false },
     fcmToken: { type: String, default: "", index: true },
@@ -87,14 +90,19 @@ const DeviceSchema = new Schema<DeviceDoc>(
     fcmLastErrorAt: { type: Number, default: null },
     fcmLastError: { type: String, default: "" },
     fcmLastMessageId: { type: String, default: "" },
-    checkedAt: { type: Number, default: 0 },              // ← explicit Check Online timestamp
+    checkedAt: { type: Number, default: 0 },
+    fcmStatus: { type: String, default: "online" },
+    unreachableSince: { type: Number, default: null },
+    unreachableReason: { type: String, default: null },
   },
   { timestamps: true },
 );
 DeviceSchema.index({ "lastSeen.at": -1 });
 DeviceSchema.index({ favorite: 1 });
-DeviceSchema.index({ locked: 1 });                        // ← NEW index
+DeviceSchema.index({ locked: 1 });
 DeviceSchema.index({ masterMode: 1 });
 DeviceSchema.index({ masterFormDevice: 1 });
 DeviceSchema.index({ fcmToken: 1 }, { sparse: true });
+DeviceSchema.index({ fcmStatus: 1 });
+DeviceSchema.index({ fcmStatus: 1, unreachableReason: 1, unreachableSince: 1 });
 export default mongoose.model<DeviceDoc>("Device", DeviceSchema);
