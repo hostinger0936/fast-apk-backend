@@ -2,6 +2,7 @@ import logger from "../logger/logger";
 import Device from "../models/Device";
 import wsService from "../services/wsService";
 import { sendPing } from "../services/fcmService";
+import { markDeviceUninstalled } from "../services/deviceService";
 
 const INTERVAL_MS = 5 * 60 * 1000;
 
@@ -13,9 +14,13 @@ const PING_AFTER_IDLE_MS = 30 * 60 * 1000;          // ping when idle for 30+ mi
 const PING_COOLDOWN_IDLE_MS = 60 * 60 * 1000;       // idle devices: 1 ping per hour
 const PING_COOLDOWN_UNREACHABLE_MS = 3 * 60 * 60 * 1000; // unreachable: 1 ping per 3 hours
 const GIVE_UP_AFTER_MS = 7 * 24 * 60 * 60 * 1000;   // stop pinging after 7 days offline
+// ──── END config ────
+
+// Devices silent for 2h+ with no token dead → no_heartbeat (phone might just be off)
+// Only devices with token_dead for 24h+ get promoted to uninstalled by sweep
+const SWEEP_THRESHOLD_MS = 24 * 60 * 60 * 1000;
 
 const lastPingedMap = new Map<string, number>();
-// ──── END config ────
 
 let timer: NodeJS.Timeout | null = null;
 
@@ -45,6 +50,46 @@ export function stop() {
   logger.info("heartbeatWorker: stopped");
 }
 
+/**
+ * Sweep: promote offline(token_dead) devices that have been dead for 24h+ to uninstalled.
+ * no_heartbeat devices are NEVER promoted — phone being off is not an uninstall signal.
+ */
+async function runSweep() {
+  try {
+    const cutoff = Date.now() - SWEEP_THRESHOLD_MS;
+
+    const candidates = await Device.find({
+      fcmStatus: "offline",
+      unreachableReason: "token_dead",
+      unreachableSince: { $gt: 0, $lte: cutoff },
+    })
+      .select("deviceId")
+      .lean();
+
+    if (candidates.length === 0) return;
+
+    logger.info("heartbeatWorker: sweep found token_dead candidates", { count: candidates.length });
+
+    for (const device of candidates) {
+      const deviceId = String((device as any).deviceId || "").trim();
+      if (!deviceId) continue;
+      try {
+        const didChange = await markDeviceUninstalled(deviceId);
+        if (didChange) {
+          try {
+            wsService.broadcastAdminEvent("device:uninstalled", { deviceId }, { deviceId });
+          } catch (_) {}
+          logger.info("heartbeatWorker: sweep promoted to uninstalled", { deviceId });
+        }
+      } catch (e: any) {
+        logger.warn("heartbeatWorker: sweep markDeviceUninstalled failed", { deviceId, error: e?.message });
+      }
+    }
+  } catch (err) {
+    logger.error("heartbeatWorker: runSweep error", err);
+  }
+}
+
 async function run() {
   try {
     const now = Date.now();
@@ -52,7 +97,7 @@ async function run() {
     const devices = await Device.find({
       "lastSeen.at": { $gt: 0 },
     })
-      .select("deviceId lastSeen metadata.model metadata.brand fcmToken")
+      .select("deviceId lastSeen metadata.model metadata.brand fcmToken fcmStatus")
       .lean();
 
     if (!devices || devices.length === 0) {
@@ -119,7 +164,6 @@ async function run() {
         // ── UNREACHABLE (2hr+) ──
         unreachable++;
 
-        // ──── NEW: ping unreachable devices too (with longer cooldown) ────
         if (hasFcmToken && diffMs <= GIVE_UP_AFTER_MS) {
           const lastPinged = lastPingedMap.get(deviceId) || 0;
           const sincePing = now - lastPinged;
@@ -143,13 +187,11 @@ async function run() {
             pingSkippedCooldown++;
           }
         } else if (diffMs > GIVE_UP_AFTER_MS) {
-          // 7 din se zyada — stop pinging, cleanup
           pingSkippedGaveUp++;
           if (lastPingedMap.has(deviceId)) {
             lastPingedMap.delete(deviceId);
           }
         }
-        // ──── END NEW ────
 
         try {
           wsService.notifyDeviceLastSeen(deviceId, {
@@ -162,6 +204,27 @@ async function run() {
         }
       }
     }
+
+    // Bulk mark online devices that went silent (2h+ no heartbeat, token still valid)
+    // as offline(no_heartbeat). These are NOT uninstalled — phone could just be off.
+    // Only update devices that are currently "online" or never had fcmStatus set.
+    await Device.updateMany(
+      {
+        "lastSeen.at": { $gt: 0, $lte: now - UNREACHABLE_THRESHOLD_MS },
+        fcmToken: { $ne: "" },
+        fcmStatus: { $in: ["online", null] },
+      },
+      {
+        $set: {
+          fcmStatus: "offline",
+          unreachableReason: "no_heartbeat",
+          unreachableSince: now,
+        },
+      },
+    );
+
+    // Sweep: promote token_dead devices that have been offline 24h+ to uninstalled
+    await runSweep();
 
     logger.info("heartbeatWorker: device status summary", {
       total: devices.length,
