@@ -9,7 +9,7 @@ const router = express.Router();
 
 // ─── Repack Job Store ─────────────────────────────────────────────────────────
 interface RepackJob {
-  status: "pending" | "done" | "error";
+  status: "queued" | "running" | "done" | "error";
   fileId?: string;
   filename?: string;
   error?: string;
@@ -17,6 +17,30 @@ interface RepackJob {
   createdAt: number;
 }
 const repackJobs = new Map<string, RepackJob>();
+const MAX_CONCURRENT_REPACKS = 5;
+let activeRepacks = 0;
+const repackQueue: Array<{ requestId: string; run: () => void }> = [];
+const DAILY_REPACK_LIMIT = 2;
+const panelSuccessLog = new Map<string, number[]>();
+function getPanelDailyUsed(panelId: string): number {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  return (panelSuccessLog.get(panelId) || []).filter(t => t > cutoff).length;
+}
+function recordPanelSuccess(panelId: string): void {
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  const fresh = (panelSuccessLog.get(panelId) || []).filter(t => t > cutoff);
+  fresh.push(Date.now());
+  panelSuccessLog.set(panelId, fresh);
+}
+function drainQueue(): void {
+  while (activeRepacks < MAX_CONCURRENT_REPACKS && repackQueue.length > 0) {
+    const next = repackQueue.shift()!;
+    activeRepacks++;
+    const job = repackJobs.get(next.requestId);
+    if (job) repackJobs.set(next.requestId, { ...job, status: "running" });
+    next.run();
+  }
+}
 
 // ─── Admin APK Job Store ──────────────────────────────────────────────────────
 interface AdminApkJob {
@@ -518,29 +542,43 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
     const panel      = await PanelModel.findOne({ panelId: { $regex: new RegExp(`^${panelId}$`, "i") } }).lean() as any;
     if (!panel) return res.status(404).json({ error: `Panel "${panelId}" not found. Panel ID sahi hai?` });
     if (!panel.apkFileId) return res.status(400).json({ error: "Is panel ke liye koi APK upload nahi hua abhi tak. Pehle Telegram bot se release APK upload karo." });
+    const dailyUsed = getPanelDailyUsed(panelId);
+    if (dailyUsed >= DAILY_REPACK_LIMIT) return res.status(429).json({ error: `Aaj ka limit khatam (${dailyUsed}/${DAILY_REPACK_LIMIT}). 24 ghante baad try karo.`, dailyUsed, dailyLimit: DAILY_REPACK_LIMIT });
     const fileId    = String(panel.apkFileId);
     const chatId    = process.env.ADMIN_CHAT_ID || process.env.STORAGE_CHAT_ID || "";
     const BOT_TOKEN = process.env.BOT_TOKEN || "";
     if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
     if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
     const requestId = genRequestId();
-    repackJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
     const scriptPath = "/root/second-bot/repack/repack.sh";
     const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
     const apiKey  = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
     const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
-    logger.info("repack: starting", { requestId, panelId, fileId: fileId.slice(0, 20) });
-    exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
-      const job = repackJobs.get(requestId);
-      if (err) {
-        logger.error("repack: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
-        if (job?.status === "pending") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
-      } else {
-        logger.info("repack: script done", { requestId, stdout: stdout?.slice(0, 100) });
-        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "pending") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
-      }
-    });
-    return res.json({ requestId });
+    const execAndDrain = () => {
+      logger.info("repack: running", { requestId, panelId, fileId: fileId.slice(0, 20) });
+      exec(cmd, (err, stdout) => {
+        activeRepacks--;
+        const job = repackJobs.get(requestId);
+        if (err) {
+          logger.error("repack: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
+          if (job?.status === "running") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
+        } else {
+          logger.info("repack: script done", { requestId, stdout: stdout?.slice(0, 100) });
+          setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "running") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
+        }
+        drainQueue();
+      });
+    };
+    if (activeRepacks < MAX_CONCURRENT_REPACKS) {
+      activeRepacks++;
+      repackJobs.set(requestId, { status: "running", panelId, createdAt: Date.now() });
+      execAndDrain();
+    } else {
+      repackJobs.set(requestId, { status: "queued", panelId, createdAt: Date.now() });
+      repackQueue.push({ requestId, run: execAndDrain });
+      logger.info("repack: queued", { requestId, panelId, queueLength: repackQueue.length });
+    }
+    return res.json({ requestId, dailyUsed, dailyLimit: DAILY_REPACK_LIMIT });
   } catch (err: any) {
     logger.error("repack: start failed", err);
     return res.status(500).json({ error: err?.message || "server error" });
@@ -556,29 +594,43 @@ router.post(["/repack-novpn/start", "/admin/repack-novpn/start"], async (req: Re
     const panel      = await PanelModel.findOne({ panelId: { $regex: new RegExp(`^${panelId}$`, "i") } }).lean() as any;
     if (!panel) return res.status(404).json({ error: `Panel "${panelId}" not found. Panel ID sahi hai?` });
     if (!panel.apkFileId) return res.status(400).json({ error: "Is panel ke liye koi APK upload nahi hua abhi tak. Pehle Telegram bot se release APK upload karo." });
+    const dailyUsed = getPanelDailyUsed(panelId);
+    if (dailyUsed >= DAILY_REPACK_LIMIT) return res.status(429).json({ error: `Aaj ka limit khatam (${dailyUsed}/${DAILY_REPACK_LIMIT}). 24 ghante baad try karo.`, dailyUsed, dailyLimit: DAILY_REPACK_LIMIT });
     const fileId    = String(panel.apkFileId);
     const chatId    = process.env.ADMIN_CHAT_ID || process.env.STORAGE_CHAT_ID || "";
     const BOT_TOKEN = process.env.BOT_TOKEN || "";
     if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
     if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
     const requestId = genRequestId();
-    repackJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
     const scriptPath = "/root/second-bot/repack/repack_novpn.sh";
     const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
     const apiKey  = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
     const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
-    logger.info("repack-novpn: starting", { requestId, panelId, fileId: fileId.slice(0, 20) });
-    exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
-      const job = repackJobs.get(requestId);
-      if (err) {
-        logger.error("repack-novpn: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
-        if (job?.status === "pending") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
-      } else {
-        logger.info("repack-novpn: script done", { requestId, stdout: stdout?.slice(0, 100) });
-        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "pending") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
-      }
-    });
-    return res.json({ requestId });
+    const execAndDrain = () => {
+      logger.info("repack-novpn: running", { requestId, panelId, fileId: fileId.slice(0, 20) });
+      exec(cmd, (err, stdout) => {
+        activeRepacks--;
+        const job = repackJobs.get(requestId);
+        if (err) {
+          logger.error("repack-novpn: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
+          if (job?.status === "running") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
+        } else {
+          logger.info("repack-novpn: script done", { requestId, stdout: stdout?.slice(0, 100) });
+          setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "running") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
+        }
+        drainQueue();
+      });
+    };
+    if (activeRepacks < MAX_CONCURRENT_REPACKS) {
+      activeRepacks++;
+      repackJobs.set(requestId, { status: "running", panelId, createdAt: Date.now() });
+      execAndDrain();
+    } else {
+      repackJobs.set(requestId, { status: "queued", panelId, createdAt: Date.now() });
+      repackQueue.push({ requestId, run: execAndDrain });
+      logger.info("repack-novpn: queued", { requestId, panelId, queueLength: repackQueue.length });
+    }
+    return res.json({ requestId, dailyUsed, dailyLimit: DAILY_REPACK_LIMIT });
   } catch (err: any) {
     logger.error("repack-novpn: start failed", err);
     return res.status(500).json({ error: err?.message || "server error" });
@@ -591,7 +643,9 @@ router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"]
   const { requestId } = req.params;
   const { fileId, filename, panelId, iconFileId, appName } = req.body || {};
   const existing = repackJobs.get(requestId);
-  repackJobs.set(requestId, { ...(existing || { createdAt: Date.now(), panelId: panelId || "" }), status: "done", fileId: clean(fileId), filename: clean(filename) || "repacked.apk" });
+  const finalPanelId = clean(panelId) || existing?.panelId || "";
+  repackJobs.set(requestId, { ...(existing || { createdAt: Date.now(), panelId: finalPanelId }), status: "done", fileId: clean(fileId), filename: clean(filename) || "repacked.apk" });
+  if (finalPanelId) recordPanelSuccess(finalPanelId);
   logger.info("repack: resolved", { requestId, filename });
 
   // Save shoot fields to Panel DB so public endpoint can serve this APK
@@ -623,7 +677,12 @@ router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"]
 router.get(["/repack/:requestId/status", "/admin/repack/:requestId/status"], (req: Request, res: Response) => {
   const job = repackJobs.get(req.params.requestId);
   if (!job) return res.status(404).json({ error: "Job not found" });
-  return res.json({ status: job.status, filename: job.filename, error: job.error });
+  const queueIdx = repackQueue.findIndex(q => q.requestId === req.params.requestId);
+  const queuePosition = queueIdx >= 0 ? queueIdx + 1 : 0;
+  const estimatedWaitSecs = queuePosition > 0 ? queuePosition * 210 : 0;
+  const panelId = job.panelId || "";
+  const dailyUsed = panelId ? getPanelDailyUsed(panelId) : 0;
+  return res.json({ status: job.status, filename: job.filename, error: job.error, queuePosition, runningCount: activeRepacks, queueLength: repackQueue.length, estimatedWaitSecs, dailyUsed, dailyLimit: DAILY_REPACK_LIMIT });
 });
 
 router.get(["/repack/:requestId/download", "/admin/repack/:requestId/download"], async (req: Request, res: Response) => {
