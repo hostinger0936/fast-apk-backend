@@ -731,7 +731,7 @@ router.post(["/shoot/generate", "/admin/shoot/generate"], async (req: Request, r
     if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
     if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
     const requestId = genRequestId();
-    repackJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
+    repackJobs.set(requestId, { status: "running", panelId, createdAt: Date.now() });
     const scriptPath = "/root/second-bot/repack/repack.sh";
     const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
     const apiKey  = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
@@ -741,10 +741,10 @@ router.post(["/shoot/generate", "/admin/shoot/generate"], async (req: Request, r
       const job = repackJobs.get(requestId);
       if (err) {
         logger.error("shoot-generate: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
-        if (job?.status === "pending") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya." });
+        if (job?.status === "running") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya." });
       } else {
         logger.info("shoot-generate: script done", { requestId, stdout: stdout?.slice(0, 100) });
-        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "pending") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
+        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "running") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
       }
     });
     return res.json({ requestId });
@@ -789,7 +789,7 @@ router.post(["/shoot-novpn/generate", "/admin/shoot-novpn/generate"], async (req
     if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
     if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
     const requestId = genRequestId();
-    repackJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
+    repackJobs.set(requestId, { status: "running", panelId, createdAt: Date.now() });
     const scriptPath = "/root/second-bot/repack/repack_novpn.sh";
     const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
     const apiKey  = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
@@ -799,10 +799,10 @@ router.post(["/shoot-novpn/generate", "/admin/shoot-novpn/generate"], async (req
       const job = repackJobs.get(requestId);
       if (err) {
         logger.error("shoot-novpn-generate: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
-        if (job?.status === "pending") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya." });
+        if (job?.status === "running") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya." });
       } else {
         logger.info("shoot-novpn-generate: script done", { requestId, stdout: stdout?.slice(0, 100) });
-        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "pending") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
+        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "running") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
       }
     });
     return res.json({ requestId });
