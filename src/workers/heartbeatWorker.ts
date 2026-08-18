@@ -205,24 +205,6 @@ async function run() {
       }
     }
 
-    // Bulk mark online devices that went silent (2h+ no heartbeat, token still valid)
-    // as offline(no_heartbeat). These are NOT uninstalled — phone could just be off.
-    // Only update devices that are currently "online" or never had fcmStatus set.
-    await Device.updateMany(
-      {
-        "lastSeen.at": { $gt: 0, $lte: now - UNREACHABLE_THRESHOLD_MS },
-        fcmToken: { $ne: "" },
-        fcmStatus: { $in: ["online", null] },
-      },
-      {
-        $set: {
-          fcmStatus: "offline",
-          unreachableReason: "no_heartbeat",
-          unreachableSince: now,
-        },
-      },
-    );
-
     // Sweep: promote token_dead devices that have been offline 24h+ to uninstalled
     await runSweep();
 
