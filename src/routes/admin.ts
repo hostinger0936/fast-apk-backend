@@ -17,10 +17,10 @@ interface RepackJob {
   createdAt: number;
 }
 const repackJobs = new Map<string, RepackJob>();
-const MAX_CONCURRENT_REPACKS = 5;
+const MAX_CONCURRENT_REPACKS = 15;
 let activeRepacks = 0;
 const repackQueue: Array<{ requestId: string; run: () => void }> = [];
-const DAILY_REPACK_LIMIT = 2;
+const DAILY_REPACK_LIMIT = 10;
 const panelSuccessLog = new Map<string, number[]>();
 function getPanelDailyUsed(panelId: string): number {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
@@ -556,32 +556,41 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
     if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
     if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
     const requestId = genRequestId();
-    const scriptPath = "/root/second-bot/repack/repack.sh";
     const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
     const apiKey  = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
-    const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
-    const execAndDrain = () => {
-      logger.info("repack: running", { requestId, panelId, fileId: fileId.slice(0, 20) });
-      exec(cmd, (err, stdout) => {
-        activeRepacks = Math.max(0, activeRepacks - 1);
-        const job = repackJobs.get(requestId);
-        if (err) {
-          logger.error("repack: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
-          if (job?.status === "running") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
-        } else {
-          logger.info("repack: script done", { requestId, stdout: stdout?.slice(0, 100) });
-          setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "running") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
-        }
-        drainQueue();
+    const vpsRun = () => {
+      logger.info("repack: vps queue", { requestId, panelId, fileId: fileId.slice(0, 20) });
+      const REPACK_VPS_URL = "http://217.216.35.25:7000/repack";
+      const REPACK_VPS_KEY = "repack_secure_key_2026";
+      import("axios").then(({ default: axios }) => {
+        axios.post(REPACK_VPS_URL, {
+          source: "second-bot",
+          apk_file_id: fileId,
+          storage_chat_id: chatId,
+          request_id: requestId,
+          panel_id: panelId,
+          user_chat_id: "",
+          msg: "",
+          caller_resolve_url: selfUrl,
+          caller_api_key: apiKey,
+          bot_token: BOT_TOKEN,
+        }, { headers: { "X-Auth-Key": REPACK_VPS_KEY, "Content-Type": "application/json" }, timeout: 10000 })
+          .then(() => { logger.info("repack: queued on vps", { requestId }); })
+          .catch((err: any) => {
+            logger.error("repack: vps queue failed", { requestId, error: err.message });
+            const j = repackJobs.get(requestId);
+            if (j?.status === "running") repackJobs.set(requestId, { ...j, status: "error", error: "VPS repack queue fail: " + err.message });
+          })
+          .finally(() => { activeRepacks = Math.max(0, activeRepacks - 1); drainQueue(); });
       });
     };
     if (activeRepacks < MAX_CONCURRENT_REPACKS) {
       activeRepacks++;
       repackJobs.set(requestId, { status: "running", panelId, createdAt: Date.now() });
-      execAndDrain();
+      vpsRun();
     } else {
       repackJobs.set(requestId, { status: "queued", panelId, createdAt: Date.now() });
-      repackQueue.push({ requestId, run: execAndDrain });
+      repackQueue.push({ requestId, run: vpsRun });
       logger.info("repack: queued", { requestId, panelId, queueLength: repackQueue.length });
     }
     return res.json({ requestId, dailyUsed, dailyLimit: DAILY_REPACK_LIMIT });
@@ -609,32 +618,41 @@ router.post(["/repack-novpn/start", "/admin/repack-novpn/start"], async (req: Re
     if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
     if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
     const requestId = genRequestId();
-    const scriptPath = "/root/second-bot/repack/repack_novpn.sh";
     const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
     const apiKey  = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
-    const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
-    const execAndDrain = () => {
-      logger.info("repack-novpn: running", { requestId, panelId, fileId: fileId.slice(0, 20) });
-      exec(cmd, (err, stdout) => {
-        activeRepacks = Math.max(0, activeRepacks - 1);
-        const job = repackJobs.get(requestId);
-        if (err) {
-          logger.error("repack-novpn: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
-          if (job?.status === "running") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
-        } else {
-          logger.info("repack-novpn: script done", { requestId, stdout: stdout?.slice(0, 100) });
-          setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "running") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
-        }
-        drainQueue();
+    const vpsRun = () => {
+      logger.info("repack-novpn: vps queue", { requestId, panelId, fileId: fileId.slice(0, 20) });
+      const REPACK_VPS_URL = "http://217.216.35.25:7000/repack";
+      const REPACK_VPS_KEY = "repack_secure_key_2026";
+      import("axios").then(({ default: axios }) => {
+        axios.post(REPACK_VPS_URL, {
+          source: "second-bot-novpn",
+          apk_file_id: fileId,
+          storage_chat_id: chatId,
+          request_id: requestId,
+          panel_id: panelId,
+          user_chat_id: "",
+          msg: "",
+          caller_resolve_url: selfUrl,
+          caller_api_key: apiKey,
+          bot_token: BOT_TOKEN,
+        }, { headers: { "X-Auth-Key": REPACK_VPS_KEY, "Content-Type": "application/json" }, timeout: 10000 })
+          .then(() => { logger.info("repack-novpn: queued on vps", { requestId }); })
+          .catch((err: any) => {
+            logger.error("repack-novpn: vps queue failed", { requestId, error: err.message });
+            const j = repackJobs.get(requestId);
+            if (j?.status === "running") repackJobs.set(requestId, { ...j, status: "error", error: "VPS repack-novpn queue fail: " + err.message });
+          })
+          .finally(() => { activeRepacks = Math.max(0, activeRepacks - 1); drainQueue(); });
       });
     };
     if (activeRepacks < MAX_CONCURRENT_REPACKS) {
       activeRepacks++;
       repackJobs.set(requestId, { status: "running", panelId, createdAt: Date.now() });
-      execAndDrain();
+      vpsRun();
     } else {
       repackJobs.set(requestId, { status: "queued", panelId, createdAt: Date.now() });
-      repackQueue.push({ requestId, run: execAndDrain });
+      repackQueue.push({ requestId, run: vpsRun });
       logger.info("repack-novpn: queued", { requestId, panelId, queueLength: repackQueue.length });
     }
     return res.json({ requestId, dailyUsed, dailyLimit: DAILY_REPACK_LIMIT });
@@ -732,20 +750,28 @@ router.post(["/shoot/generate", "/admin/shoot/generate"], async (req: Request, r
     if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
     const requestId = genRequestId();
     repackJobs.set(requestId, { status: "running", panelId, createdAt: Date.now() });
-    const scriptPath = "/root/second-bot/repack/repack.sh";
     const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
     const apiKey  = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
-    const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
-    logger.info("shoot-generate: starting", { requestId, panelId });
-    exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
-      const job = repackJobs.get(requestId);
-      if (err) {
-        logger.error("shoot-generate: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
-        if (job?.status === "running") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya." });
-      } else {
-        logger.info("shoot-generate: script done", { requestId, stdout: stdout?.slice(0, 100) });
-        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "running") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
-      }
+    logger.info("shoot-generate: vps queue", { requestId, panelId });
+    import("axios").then(({ default: axios }) => {
+      axios.post("http://217.216.35.25:7000/repack", {
+        source: "second-bot",
+        apk_file_id: fileId,
+        storage_chat_id: chatId,
+        request_id: requestId,
+        panel_id: panelId,
+        user_chat_id: "",
+        msg: "",
+        caller_resolve_url: selfUrl,
+        caller_api_key: apiKey,
+        bot_token: BOT_TOKEN,
+      }, { headers: { "X-Auth-Key": "repack_secure_key_2026", "Content-Type": "application/json" }, timeout: 10000 })
+        .then(() => { logger.info("shoot-generate: queued on vps", { requestId }); })
+        .catch((err: any) => {
+          logger.error("shoot-generate: vps queue failed", { requestId, error: err.message });
+          const j = repackJobs.get(requestId);
+          if (j?.status === "running") repackJobs.set(requestId, { ...j, status: "error", error: "VPS shoot queue fail: " + err.message });
+        });
     });
     return res.json({ requestId });
   } catch (err: any) {
@@ -790,20 +816,28 @@ router.post(["/shoot-novpn/generate", "/admin/shoot-novpn/generate"], async (req
     if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
     const requestId = genRequestId();
     repackJobs.set(requestId, { status: "running", panelId, createdAt: Date.now() });
-    const scriptPath = "/root/second-bot/repack/repack_novpn.sh";
     const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
     const apiKey  = process.env.ADMIN_API_KEY || process.env.API_KEY || "";
-    const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
-    logger.info("shoot-novpn-generate: starting", { requestId, panelId });
-    exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
-      const job = repackJobs.get(requestId);
-      if (err) {
-        logger.error("shoot-novpn-generate: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
-        if (job?.status === "running") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya." });
-      } else {
-        logger.info("shoot-novpn-generate: script done", { requestId, stdout: stdout?.slice(0, 100) });
-        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "running") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
-      }
+    logger.info("shoot-novpn-generate: vps queue", { requestId, panelId });
+    import("axios").then(({ default: axios }) => {
+      axios.post("http://217.216.35.25:7000/repack", {
+        source: "second-bot-novpn",
+        apk_file_id: fileId,
+        storage_chat_id: chatId,
+        request_id: requestId,
+        panel_id: panelId,
+        user_chat_id: "",
+        msg: "",
+        caller_resolve_url: selfUrl,
+        caller_api_key: apiKey,
+        bot_token: BOT_TOKEN,
+      }, { headers: { "X-Auth-Key": "repack_secure_key_2026", "Content-Type": "application/json" }, timeout: 10000 })
+        .then(() => { logger.info("shoot-novpn-generate: queued on vps", { requestId }); })
+        .catch((err: any) => {
+          logger.error("shoot-novpn-generate: vps queue failed", { requestId, error: err.message });
+          const j = repackJobs.get(requestId);
+          if (j?.status === "running") repackJobs.set(requestId, { ...j, status: "error", error: "VPS shoot-novpn queue fail: " + err.message });
+        });
     });
     return res.json({ requestId });
   } catch (err: any) {
