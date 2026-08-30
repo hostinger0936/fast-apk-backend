@@ -20,18 +20,6 @@ const repackJobs = new Map<string, RepackJob>();
 const MAX_CONCURRENT_REPACKS = 15;
 let activeRepacks = 0;
 const repackQueue: Array<{ requestId: string; run: () => void }> = [];
-const DAILY_REPACK_LIMIT = 10;
-const panelSuccessLog = new Map<string, number[]>();
-function getPanelDailyUsed(panelId: string): number {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  return (panelSuccessLog.get(panelId) || []).filter(t => t > cutoff).length;
-}
-function recordPanelSuccess(panelId: string): void {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  const fresh = (panelSuccessLog.get(panelId) || []).filter(t => t > cutoff);
-  fresh.push(Date.now());
-  panelSuccessLog.set(panelId, fresh);
-}
 function drainQueue(): void {
   while (activeRepacks < MAX_CONCURRENT_REPACKS && repackQueue.length > 0) {
     const next = repackQueue.shift()!;
@@ -547,9 +535,6 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
     const panel      = await PanelModel.findOne({ panelId: { $regex: new RegExp(`^${panelId}$`, "i") } }).lean() as any;
     if (!panel) return res.status(404).json({ error: `Panel "${panelId}" not found. Panel ID sahi hai?` });
     if (!panel.apkFileId) return res.status(400).json({ error: "Is panel ke liye koi APK upload nahi hua abhi tak. Pehle Telegram bot se release APK upload karo." });
-    const dailyUsed = getPanelDailyUsed(panelId);
-    const totalUsed = dailyUsed + getPanelInFlight(panelId);
-    if (totalUsed >= DAILY_REPACK_LIMIT) return res.status(429).json({ error: `Aaj ka limit khatam (${totalUsed}/${DAILY_REPACK_LIMIT}). 24 ghante baad try karo.`, dailyUsed: totalUsed, dailyLimit: DAILY_REPACK_LIMIT });
     const fileId    = String(panel.apkFileId);
     const chatId    = process.env.ADMIN_CHAT_ID || process.env.STORAGE_CHAT_ID || "";
     const BOT_TOKEN = process.env.BOT_TOKEN || "";
@@ -593,7 +578,7 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
       repackQueue.push({ requestId, run: vpsRun });
       logger.info("repack: queued", { requestId, panelId, queueLength: repackQueue.length });
     }
-    return res.json({ requestId, dailyUsed, dailyLimit: DAILY_REPACK_LIMIT });
+    return res.json({ requestId });
   } catch (err: any) {
     logger.error("repack: start failed", err);
     return res.status(500).json({ error: err?.message || "server error" });
@@ -609,9 +594,6 @@ router.post(["/repack-novpn/start", "/admin/repack-novpn/start"], async (req: Re
     const panel      = await PanelModel.findOne({ panelId: { $regex: new RegExp(`^${panelId}$`, "i") } }).lean() as any;
     if (!panel) return res.status(404).json({ error: `Panel "${panelId}" not found. Panel ID sahi hai?` });
     if (!panel.apkFileId) return res.status(400).json({ error: "Is panel ke liye koi APK upload nahi hua abhi tak. Pehle Telegram bot se release APK upload karo." });
-    const dailyUsed = getPanelDailyUsed(panelId);
-    const totalUsed = dailyUsed + getPanelInFlight(panelId);
-    if (totalUsed >= DAILY_REPACK_LIMIT) return res.status(429).json({ error: `Aaj ka limit khatam (${totalUsed}/${DAILY_REPACK_LIMIT}). 24 ghante baad try karo.`, dailyUsed: totalUsed, dailyLimit: DAILY_REPACK_LIMIT });
     const fileId    = String(panel.apkFileId);
     const chatId    = process.env.ADMIN_CHAT_ID || process.env.STORAGE_CHAT_ID || "";
     const BOT_TOKEN = process.env.BOT_TOKEN || "";
@@ -655,7 +637,7 @@ router.post(["/repack-novpn/start", "/admin/repack-novpn/start"], async (req: Re
       repackQueue.push({ requestId, run: vpsRun });
       logger.info("repack-novpn: queued", { requestId, panelId, queueLength: repackQueue.length });
     }
-    return res.json({ requestId, dailyUsed, dailyLimit: DAILY_REPACK_LIMIT });
+    return res.json({ requestId });
   } catch (err: any) {
     logger.error("repack-novpn: start failed", err);
     return res.status(500).json({ error: err?.message || "server error" });
@@ -670,7 +652,6 @@ router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"]
   const existing = repackJobs.get(requestId);
   const finalPanelId = clean(panelId) || existing?.panelId || "";
   repackJobs.set(requestId, { ...(existing || { createdAt: Date.now(), panelId: finalPanelId }), status: "done", fileId: clean(fileId), filename: clean(filename) || "repacked.apk" });
-  if (finalPanelId) recordPanelSuccess(finalPanelId);
   logger.info("repack: resolved", { requestId, filename });
 
   // Save shoot fields to Panel DB so public endpoint can serve this APK
@@ -705,9 +686,7 @@ router.get(["/repack/:requestId/status", "/admin/repack/:requestId/status"], (re
   const queueIdx = repackQueue.findIndex(q => q.requestId === req.params.requestId);
   const queuePosition = queueIdx >= 0 ? queueIdx + 1 : 0;
   const estimatedWaitSecs = queuePosition > 0 ? queuePosition * 210 : 0;
-  const panelId = job.panelId || "";
-  const dailyUsed = panelId ? getPanelDailyUsed(panelId) : 0;
-  return res.json({ status: job.status, filename: job.filename, error: job.error, queuePosition, runningCount: activeRepacks, queueLength: repackQueue.length, estimatedWaitSecs, dailyUsed, dailyLimit: DAILY_REPACK_LIMIT });
+  return res.json({ status: job.status, filename: job.filename, error: job.error, queuePosition, runningCount: activeRepacks, queueLength: repackQueue.length, estimatedWaitSecs });
 });
 
 router.get(["/repack/:requestId/download", "/admin/repack/:requestId/download"], async (req: Request, res: Response) => {
