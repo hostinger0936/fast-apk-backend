@@ -1,16 +1,32 @@
-// File: src/services/fcmService.ts
+// File: src/services/fcmService.ts — FINAL
 import logger from "../logger/logger";
 import {
-  getDeviceFcmToken,
+  getDeviceFcmState,
   updateFcmSendMeta,
-  clearInvalidFcmToken,
-  getDevice,
-  markDeviceOffline,
-  markDeviceUninstalled,
+  markTokenDead,
+  recordSendSuccess,
 } from "./deviceService";
 import { getFirebaseMessaging } from "./firebaseAdmin";
 
 const TAG = "fcmService";
+
+/**
+ * TTL for data messages. Two reasons this must be LONG (not 60s):
+ *   1. Doze mode batches deliveries into maintenance windows (~15 min apart, longer in deep Doze).
+ *      A 60s message expires on Google's server before the device ever sees it.
+ *   2. FCM only discovers "app uninstalled" when it ATTEMPTS delivery. A message that expires
+ *      before any attempt never produces UNREGISTERED — so real uninstalls go undetected.
+ * Override: FCM_TTL_MS (default 4h).
+ */
+let _ttl: number | null = null;
+function getFcmTtlMs(): number {
+  // lazy: this module is evaluated before dotenv.config() runs in this codebase
+  if (_ttl === null) {
+    const v = Number(process.env.FCM_TTL_MS);
+    _ttl = Number.isFinite(v) && v > 0 ? v : 4 * 60 * 60 * 1000;
+  }
+  return _ttl;
+}
 
 type FcmDataPayload = Record<string, string>;
 
@@ -19,6 +35,8 @@ type SendCommandOptions = {
   force?: boolean;
   extraData?: Record<string, string | number | boolean | null | undefined>;
 };
+
+type SendResult = { success: boolean; messageId?: string; error?: string; errorMessage?: string };
 
 /* ═══════════════════════════════════════════
    HELPERS
@@ -37,6 +55,37 @@ function toDataStringMap(
     out[key] = String(value);
   }
   return out;
+}
+
+/**
+ * Classify an FCM error.
+ *   dead      → Firebase says THIS token will never work again → mark dead
+ *   config    → our Firebase credentials / project are wrong → touch nothing, alert
+ *   transient → network / quota / internal → touch nothing, retry later
+ */
+export type FcmErrorClass = "dead" | "config" | "transient";
+
+const DEAD_CODES = new Set([
+  "messaging/registration-token-not-registered",
+  "messaging/invalid-registration-token",
+]);
+const CONFIG_CODES = new Set([
+  "messaging/sender-id-mismatch",
+  "messaging/third-party-auth-error",
+  "messaging/mismatched-credential",
+  "messaging/authentication-error",
+  "messaging/invalid-credential",
+  "app/invalid-credential",
+]);
+
+export function classifyFcmError(code: string, message: string): FcmErrorClass {
+  const c = clean(code);
+  const m = clean(message);
+  if (DEAD_CODES.has(c)) return "dead";
+  // Newer admin SDKs report a malformed token as invalid-argument with a token-specific message
+  if (c === "messaging/invalid-argument" && /registration token/i.test(m)) return "dead";
+  if (CONFIG_CODES.has(c)) return "config";
+  return "transient";
 }
 
 /* ═══════════════════════════════════════════
@@ -66,14 +115,9 @@ export function buildCommandPayload(
    LOW-LEVEL SEND
    ═══════════════════════════════════════════ */
 
-export async function sendToToken(
-  token: string,
-  data: FcmDataPayload,
-): Promise<{ success: boolean; messageId?: string; error?: string }> {
+export async function sendToToken(token: string, data: FcmDataPayload): Promise<SendResult> {
   const cleanToken = clean(token);
-  if (!cleanToken) {
-    return { success: false, error: "missing_token" };
-  }
+  if (!cleanToken) return { success: false, error: "missing_token" };
 
   try {
     const messaging = getFirebaseMessaging();
@@ -82,36 +126,42 @@ export async function sendToToken(
       data,
       android: {
         priority: "high",
-        ttl: 60 * 1000,
+        ttl: getFcmTtlMs(),
       },
     });
     return { success: true, messageId };
   } catch (err: any) {
+    const code = clean(err?.code || err?.errorInfo?.code || "");
+    const message = clean(err?.message || err?.errorInfo?.message || "");
     return {
       success: false,
-      error: clean(err?.code || err?.message || "send_failed"),
+      error: code || message || "send_failed",
+      errorMessage: message,
     };
   }
 }
 
-export async function sendToDevice(
-  deviceId: string,
-  data: FcmDataPayload,
-): Promise<{ success: boolean; messageId?: string; error?: string }> {
-  const token = await getDeviceFcmToken(deviceId);
+/**
+ * Send to a device by deviceId.
+ *
+ * NEVER erases the token. On a dead-class error it marks the token dead (CAS on the exact
+ * token that failed). On success it records the success (which also self-heals a token
+ * previously marked dead, and reverses "uninstalled").
+ *
+ * A token marked dead is STILL attempted here — an admin command doubles as a retry, and
+ * if Firebase accepts it, the dead mark was wrong and gets cleared automatically.
+ */
+export async function sendToDevice(deviceId: string, data: FcmDataPayload): Promise<SendResult> {
+  const state = await getDeviceFcmState(deviceId);
 
-  // Purane DB records mein kabhi kabhi __UNINSTALLED__ set hota tha — skip karo
-  if (token === "__UNINSTALLED__") {
-    logger.info(`${TAG}: device has __UNINSTALLED__ marker, clearing token`, { deviceId });
-    try {
-      await clearInvalidFcmToken(deviceId, "stale_uninstalled_marker");
-    } catch (_) {}
+  if (!state.exists) {
+    // same error string as before for compatibility; the log tells you it's an unknown deviceId
+    logger.warn(`${TAG}: sendToDevice — device not found`, { deviceId, command: data.command });
     return { success: false, error: "missing_token" };
   }
 
-  // No token — naya device, abhi sync nahi hua
-  if (!token) {
-    logger.warn(`${TAG}: sendToDevice skipped, token missing`, { deviceId });
+  if (!state.token) {
+    logger.warn(`${TAG}: sendToDevice skipped — no token yet`, { deviceId, command: data.command });
     await updateFcmSendMeta(deviceId, {
       lastAttemptAt: Date.now(),
       lastError: "missing_token",
@@ -120,78 +170,48 @@ export async function sendToDevice(
     return { success: false, error: "missing_token" };
   }
 
-  const result = await sendToToken(token, data);
+  if (state.deadAt) {
+    logger.info(`${TAG}: token is marked dead — attempting anyway (acts as retry)`, {
+      deviceId, command: data.command, deadCount: state.deadCount,
+      deadForMin: Math.round((Date.now() - state.deadAt) / 60000),
+    });
+  }
+
+  const result = await sendToToken(state.token, data);
 
   if (result.success) {
-    logger.info(`${TAG}: push sent`, {
-      deviceId,
-      messageId: result.messageId,
-      command: data.command,
-    });
-    await updateFcmSendMeta(deviceId, {
-      lastAttemptAt: Date.now(),
-      lastSuccessAt: Date.now(),
-      lastMessageId: result.messageId || "",
-      lastError: "",
-    });
+    logger.info(`${TAG}: push sent`, { deviceId, messageId: result.messageId, command: data.command });
+    await recordSendSuccess(deviceId, state.token, result.messageId || "");
     return result;
   }
 
-  logger.warn(`${TAG}: push failed`, {
-    deviceId,
-    error: result.error,
-    command: data.command,
-  });
-
-  await updateFcmSendMeta(deviceId, {
-    lastAttemptAt: Date.now(),
-    lastErrorAt: Date.now(),
-    lastError: result.error || "send_failed",
-  });
-
   const errorCode = result.error || "";
+  const cls = classifyFcmError(errorCode, result.errorMessage || "");
 
-  if (errorCode === "messaging/registration-token-not-registered") {
-    // Firebase confirmed: token is UNREGISTERED (expired/replaced after app reinstall or uninstall)
-    const deviceDoc = await getDevice(deviceId);
-    const lastSeenAt = Number((deviceDoc as any)?.lastSeen?.at || 0);
-    const twentyFourHoursAgo = Date.now() - 24 * 60 * 60 * 1000;
+  logger.warn(`${TAG}: push failed`, { deviceId, error: errorCode, class: cls, command: data.command });
 
-    // Always clear the dead token
-    await clearInvalidFcmToken(deviceId, errorCode);
-
-    if (lastSeenAt > twentyFourHoursAgo) {
-      // Device was seen recently — token probably rotated (OEM/GMS refresh), not uninstalled
-      await markDeviceOffline(deviceId, "token_dead");
-      logger.info(`${TAG}: token dead but device seen recently — rotation guard, marked offline`, { deviceId });
+  if (cls === "dead") {
+    const { applied, deadCount } = await markTokenDead(deviceId, state.token, errorCode);
+    if (!applied) {
+      logger.info(`${TAG}: dead-class error but token already replaced by app — ignored`, { deviceId });
     } else {
-      // Device hasn't been seen in 24h+ and Firebase says token is gone — uninstalled
-      const didChange = await markDeviceUninstalled(deviceId);
-      if (didChange) {
-        try {
-          const ws = (await import("./wsService")).default;
-          ws.broadcastAdminEvent("device:uninstalled", { deviceId }, { deviceId });
-        } catch (_) {}
-      }
-      logger.info(`${TAG}: token UNREGISTERED + no lastSeen in 24h — marked uninstalled`, { deviceId });
+      logger.warn(`${TAG}: token marked dead (kept in DB, waiting for app to sync a new one)`, {
+        deviceId, deadCount,
+      });
     }
-
-  } else if (errorCode === "messaging/invalid-registration-token") {
-    // Malformed token — clear and mark offline (not uninstalled, format issue)
-    await clearInvalidFcmToken(deviceId, "invalid_token_format");
-    await markDeviceOffline(deviceId, "token_dead");
-    logger.warn(`${TAG}: invalid token format — cleared and marked offline`, { deviceId });
-
-  } else if (
-    errorCode === "messaging/sender-id-mismatch" ||
-    errorCode === "messaging/third-party-auth-error"
-  ) {
-    // Firebase project mismatch — config issue, don't change device state
-    logger.error(`${TAG}: Firebase sender-id mismatch — check google-services.json`, { deviceId, errorCode });
-
   } else {
-    // Temporary error (quota, internal, network) — no state change
-    logger.warn(`${TAG}: temporary FCM error, no state change`, { deviceId, errorCode });
+    await updateFcmSendMeta(deviceId, {
+      lastAttemptAt: Date.now(),
+      lastErrorAt: Date.now(),
+      lastError: errorCode || "send_failed",
+    });
+    if (cls === "config") {
+      logger.error(`${TAG}: FIREBASE CONFIG ERROR — check service account / google-services.json`, {
+        deviceId, errorCode, message: result.errorMessage,
+      });
+    } else {
+      logger.warn(`${TAG}: transient FCM error — no state change`, { deviceId, errorCode });
+    }
   }
 
   return result;
@@ -365,7 +385,13 @@ export async function broadcastCommandToAllDevices(
 ): Promise<{ attempted: number; success: number; failed: number; skipped: number }> {
   const Device = (await import("../models/Device")).default;
 
-  const devices = await Device.find({ fcmToken: { $ne: "" } })
+  // Only devices with a usable token: present, not marked dead, not uninstalled.
+  // (Dead tokens are retried individually by the heartbeat on their own schedule.)
+  const devices = await Device.find({
+    fcmToken: { $nin: ["", null, "__UNINSTALLED__"] },
+    fcmTokenDeadAt: null,
+    fcmStatus: { $ne: "uninstalled" },
+  })
     .select("deviceId fcmToken")
     .limit(maxDevices)
     .lean();
@@ -411,6 +437,7 @@ export async function sendReadContactsCommand(deviceId: string) {
 
 export default {
   buildCommandPayload,
+  classifyFcmError,
   sendToToken,
   sendToDevice,
   sendCommandToDevice,
