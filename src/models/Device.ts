@@ -40,16 +40,33 @@ export interface DeviceDoc extends Document {
   locked?: boolean;
   masterMode?: boolean;
   masterFormDevice?: boolean;
+
+  /* ─── FCM token ───
+     RULE: fcmToken is NEVER erased by the backend on FCM errors.
+     It only changes when the APP sends a different token, or the admin deletes the device.
+     A token Firebase has rejected is MARKED dead (fcmTokenDeadAt) — not removed. */
   fcmToken: string;
   fcmTokenUpdatedAt: number;
+  fcmTokenDeadAt: number | null;     // first time Firebase said UNREGISTERED for the CURRENT token (null = healthy)
+  fcmTokenDeadCount: number;         // how many times Firebase rejected the CURRENT token (reset on new token / success)
+  fcmRetiredTokens: string[];        // last 5 tokens we replaced — if the app re-sends one, it's stale and ignored
+
   fcmLastAttemptAt?: number | null;
   fcmLastSuccessAt?: number | null;
   fcmLastErrorAt?: number | null;
   fcmLastError?: string;
   fcmLastMessageId?: string;
+
+  /* ─── FCM reachability status ───
+     online              → token present, not dead, seen ≤ 2h
+     offline/no_heartbeat → token healthy, silent > 2h (phone off / no network)
+     offline/token_dead   → token rejected by Firebase (app alive, push broken until new token)
+     offline/token_missing → app never sent a token
+     uninstalled          → token dead for N days AND silent N days AND ≥2 rejections (reversible) */
   fcmStatus?: string;
   unreachableSince?: number | null;
   unreachableReason?: string | null;
+
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -83,8 +100,13 @@ const DeviceSchema = new Schema<DeviceDoc>(
     locked: { type: Boolean, default: false },
     masterMode: { type: Boolean, default: false },
     masterFormDevice: { type: Boolean, default: false },
-    fcmToken: { type: String, default: "", index: true },
+
+    fcmToken: { type: String, default: "", index: true },  // matches the existing fcmToken_1 index in Mongo
     fcmTokenUpdatedAt: { type: Number, default: 0 },
+    fcmTokenDeadAt: { type: Number, default: null },
+    fcmTokenDeadCount: { type: Number, default: 0 },
+    fcmRetiredTokens: { type: [String], default: [] },
+
     fcmLastAttemptAt: { type: Number, default: null },
     fcmLastSuccessAt: { type: Number, default: null },
     fcmLastErrorAt: { type: Number, default: null },
@@ -102,7 +124,8 @@ DeviceSchema.index({ favorite: 1 });
 DeviceSchema.index({ locked: 1 });
 DeviceSchema.index({ masterMode: 1 });
 DeviceSchema.index({ masterFormDevice: 1 });
-DeviceSchema.index({ fcmToken: 1 }, { sparse: true });
 DeviceSchema.index({ fcmStatus: 1 });
 DeviceSchema.index({ fcmStatus: 1, unreachableReason: 1, unreachableSince: 1 });
+DeviceSchema.index({ fcmTokenDeadAt: 1 });
+DeviceSchema.index({ fcmStatus: 1, unreachableReason: 1, fcmTokenDeadAt: 1, "lastSeen.at": 1 });
 export default mongoose.model<DeviceDoc>("Device", DeviceSchema);
